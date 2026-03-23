@@ -21,6 +21,12 @@ pub(crate) const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u32 = 885_588; // mainne
 pub(crate) const TAP_DMT_PARSEINT_ACTIVATION_HEIGHT: u32 = 885_588; // mainnet
 pub(crate) const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
 pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainnet
+// START MINER-REWARD-SHIELD
+pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet TBD before deployment
+// END MINER-REWARD-SHIELD
+// START MINER-REWARD-SHIELD
+pub(crate) const TAP_DMT_REWARD_ADDRESS_PREFIX: &str = "dmtrwd";
+// END MINER-REWARD-SHIELD
 
 // TAP Bloom Filter constants
 pub(crate) const TAP_BLOOM_K: u8 = 10;
@@ -46,6 +52,9 @@ pub(crate) enum TapFeature {
   DmtParseintActivation,
   TokenAuthWhitelistFixActivation,
   TestnetFixActivation,
+  // START MINER-REWARD-SHIELD
+  MinerRewardShieldActivation,
+  // END MINER-REWARD-SHIELD
 }
 pub(crate) mod ops {
   pub(super) mod bitmap;
@@ -430,10 +439,950 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::DmtParseintActivation => TAP_DMT_PARSEINT_ACTIVATION_HEIGHT,
       TapFeature::TokenAuthWhitelistFixActivation => TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT,
       TapFeature::TestnetFixActivation => TAP_TESTNET_FIX_ACTIVATION_HEIGHT,
+      // START MINER-REWARD-SHIELD
+      TapFeature::MinerRewardShieldActivation => TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT,
+      // END MINER-REWARD-SHIELD
     }
   }
   pub(crate) fn json_stringify_lower(s: &str) -> String {
     serde_json::to_string(&s.to_lowercase()).unwrap_or_else(|_| format!("\"{}\"", s.to_lowercase()))
   }
 
+  // START MINER-REWARD-SHIELD
+  pub(crate) fn tap_dmt_reward_address_key(address: &str) -> String {
+    format!("{}/{}", TAP_DMT_REWARD_ADDRESS_PREFIX, address)
+  }
+
+  pub(crate) fn tap_is_dmt_reward_address(&mut self, address: &str) -> bool {
+    if !self.tap_feature_enabled(TapFeature::MinerRewardShieldActivation) { return false; }
+    self.tap_get::<String>(&Self::tap_dmt_reward_address_key(address)).ok().flatten().is_some()
+  }
+
+  pub(crate) fn tap_mark_dmt_reward_address(&mut self, address: &str) {
+    if !self.tap_feature_enabled(TapFeature::MinerRewardShieldActivation) { return; }
+    if self.tap_get::<String>(&Self::tap_dmt_reward_address_key(address)).ok().flatten().is_some() { return; }
+    let _ = self.tap_put(&Self::tap_dmt_reward_address_key(address), &"".to_string());
+    // Auto-block transferables once on first reward credit, but do not re-block if the miner
+    // later unblocks deliberately.
+    if self.tap_get::<String>(&format!("bltr/{}", address)).ok().flatten().is_none() {
+      let _ = self.tap_put(&format!("bltr/{}", address), &"".to_string());
+    }
+  }
+  // END MINER-REWARD-SHIELD
+
 }
+
+// START MINER-REWARD-SHIELD
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{Inscription, InscriptionId};
+  use crate::index::{
+    HOME_INSCRIPTIONS, INSCRIPTION_ID_TO_SEQUENCE_NUMBER, INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER,
+    SEQUENCE_NUMBER_TO_CHILDREN, SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY, SAT_TO_SEQUENCE_NUMBER,
+    TAP_KV, TRANSACTION_ID_TO_TRANSACTION,
+  };
+  use bitcoin::{OutPoint, Txid};
+  use redb::Database;
+  use std::{collections::HashMap, str::FromStr};
+  use tempfile::TempDir;
+
+  const MINER_ADDRESS: &str = "tb1q6en7qjxgw4ev8xwx94pzdry6a6ky7wlfeqzunz";
+  const USER_ADDRESS: &str = "tb1qjsv26lap3ffssj6hfy8mzn0lg5vte6a42j75ww";
+  const RECIPIENT_ADDRESS: &str = "tb1qakxxzv9n7706kc3xdcycrtfv8cqv62hnwexc0l";
+
+  fn with_test_updater<T>(
+    network: BtcNetwork,
+    height: u32,
+    test: impl FnOnce(&mut InscriptionUpdater<'_, '_>) -> T,
+  ) -> T {
+    let tempdir = TempDir::new().unwrap();
+    let db = Database::create(tempdir.path().join("tap-miner-reward-shield.redb")).unwrap();
+    let write_tx = db.begin_write().unwrap();
+
+    let mut home_inscriptions = write_tx.open_table(HOME_INSCRIPTIONS).unwrap();
+    let mut id_to_sequence_number = write_tx.open_table(INSCRIPTION_ID_TO_SEQUENCE_NUMBER).unwrap();
+    let mut inscription_number_to_sequence_number =
+      write_tx.open_table(INSCRIPTION_NUMBER_TO_SEQUENCE_NUMBER).unwrap();
+    let mut transaction_id_to_transaction = write_tx.open_table(TRANSACTION_ID_TO_TRANSACTION).unwrap();
+    let mut sat_to_sequence_number = write_tx.open_multimap_table(SAT_TO_SEQUENCE_NUMBER).unwrap();
+    let mut sequence_number_to_children =
+      write_tx.open_multimap_table(SEQUENCE_NUMBER_TO_CHILDREN).unwrap();
+    let mut sequence_number_to_entry =
+      write_tx.open_table(SEQUENCE_NUMBER_TO_INSCRIPTION_ENTRY).unwrap();
+    let mut tap_kv = write_tx.open_table(TAP_KV).unwrap();
+
+    let mut updater = InscriptionUpdater {
+      blessed_inscription_count: 0,
+      cursed_inscription_count: 0,
+      flotsam: Vec::new(),
+      height,
+      run_start_height: height,
+      home_inscription_count: 0,
+      home_inscriptions: &mut home_inscriptions,
+      id_to_sequence_number: &mut id_to_sequence_number,
+      inscription_number_to_sequence_number: &mut inscription_number_to_sequence_number,
+      lost_sats: 0,
+      next_sequence_number: 0,
+      reward: 0,
+      transaction_buffer: Vec::new(),
+      transaction_id_to_transaction: &mut transaction_id_to_transaction,
+      sat_to_sequence_number: &mut sat_to_sequence_number,
+      sequence_number_to_children: &mut sequence_number_to_children,
+      sequence_number_to_entry: &mut sequence_number_to_entry,
+      timestamp: 0,
+      unbound_inscriptions: 0,
+      tap_db: TapBatch::new(&mut tap_kv),
+      dmt_bloom: None,
+      priv_bloom: None,
+      list_len_cache: HashMap::new(),
+      any_bloom: None,
+      block_availability_cache: HashMap::new(),
+      profile: false,
+      prof_bm_tr_ms: 0,
+      prof_bm_tr_ct: 0,
+      prof_dmt_tr_ms: 0,
+      prof_dmt_tr_ct: 0,
+      prof_prv_tr_ms: 0,
+      prof_prv_tr_ct: 0,
+      prof_ttr_ex_ms: 0,
+      prof_ttr_ex_ct: 0,
+      prof_tsend_ex_ms: 0,
+      prof_tsend_ex_ct: 0,
+      prof_ttrade_ex_ms: 0,
+      prof_ttrade_ex_ct: 0,
+      prof_tauth_ex_ms: 0,
+      prof_tauth_ex_ct: 0,
+      prof_pra_ex_ms: 0,
+      prof_pra_ex_ct: 0,
+      prof_blk_ex_ms: 0,
+      prof_blk_ex_ct: 0,
+      prof_unblk_ex_ms: 0,
+      prof_unblk_ex_ct: 0,
+      prof_created_total_ms: 0,
+      prof_created_ct: 0,
+      prof_bm_cr_ms: 0,
+      prof_bm_cr_ct: 0,
+      prof_dmt_el_cr_ms: 0,
+      prof_dmt_el_cr_ct: 0,
+      prof_dpl_cr_ms: 0,
+      prof_dpl_cr_ct: 0,
+      prof_dmtmint_cr_ms: 0,
+      prof_dmtmint_cr_ct: 0,
+      prof_mint_cr_ms: 0,
+      prof_mint_cr_ct: 0,
+      prof_ttr_cr_ms: 0,
+      prof_ttr_cr_ct: 0,
+      prof_tsend_cr_ms: 0,
+      prof_tsend_cr_ct: 0,
+      prof_ttrade_cr_ms: 0,
+      prof_ttrade_cr_ct: 0,
+      prof_tauth_cr_ms: 0,
+      prof_tauth_cr_ct: 0,
+      prof_dmtdep_cr_ms: 0,
+      prof_dmtdep_cr_ct: 0,
+      prof_pra_cr_ms: 0,
+      prof_pra_cr_ct: 0,
+      prof_prv_cr_ms: 0,
+      prof_prv_cr_ct: 0,
+      prof_blk_cr_ms: 0,
+      prof_blk_cr_ct: 0,
+      prof_unblk_cr_ms: 0,
+      prof_unblk_cr_ct: 0,
+      prof_core_env_ms: 0,
+      prof_core_old_ms: 0,
+      prof_core_new_ms: 0,
+      prof_core_parent_ms: 0,
+      prof_core_txdb_ms: 0,
+      prof_core_addr_ms: 0,
+      prof_core_update_ms: 0,
+      prof_core_event_ms: 0,
+      prof_core_event_ct: 0,
+      prof_core_old_ct: 0,
+      prof_core_new_ct: 0,
+      prof_core_txdb_ct: 0,
+      prof_core_addr_ct: 0,
+      prof_core_update_ct: 0,
+      prof_core_up_old_ms: 0,
+      prof_core_up_old_ct: 0,
+      prof_core_up_new_ms: 0,
+      prof_core_up_new_ct: 0,
+      prof_core_up_new_parents_us: 0,
+      prof_core_up_new_entry_us: 0,
+      prof_core_up_new_serialize_us: 0,
+      prof_core_up_new_maps_us: 0,
+      prof_core_up_new_num_us: 0,
+      prof_core_up_new_sat_us: 0,
+      prof_core_up_new_delegate_us: 0,
+      prof_core_up_tap_us: 0,
+      prof_core_up_utxo_us: 0,
+      delegate_cache: HashMap::new(),
+      delegate_payload_cache: HashMap::new(),
+      btc_network: network,
+    };
+
+    test(&mut updater)
+  }
+
+  fn txid_from_seed(seed: u8) -> Txid {
+    Txid::from_str(&format!("{seed:064x}")).unwrap()
+  }
+
+  fn inscription_id_from_seed(seed: u8) -> InscriptionId {
+    InscriptionId {
+      txid: txid_from_seed(seed),
+      index: 0,
+    }
+  }
+
+  fn satpoint_from_inscription(inscription_id: InscriptionId, vout: u32) -> SatPoint {
+    SatPoint {
+      outpoint: OutPoint {
+        txid: inscription_id.txid,
+        vout,
+      },
+      offset: 0,
+    }
+  }
+
+  fn transfer_satpoint(seed: u8, vout: u32) -> SatPoint {
+    SatPoint {
+      outpoint: OutPoint {
+        txid: txid_from_seed(seed),
+        vout,
+      },
+      offset: 0,
+    }
+  }
+
+  fn inscription_from_json(json: serde_json::Value) -> Inscription {
+    Inscription {
+      body: Some(serde_json::to_vec(&json).unwrap()),
+      ..Default::default()
+    }
+  }
+
+  fn deploy_record(tick: &str, addr: &str) -> DeployRecord {
+    DeployRecord {
+      tick: tick.to_string(),
+      max: "21000000".to_string(),
+      lim: "1000".to_string(),
+      dec: 0,
+      blck: 0,
+      tx: txid_from_seed(200).to_string(),
+      vo: 0,
+      val: "1000".to_string(),
+      ins: inscription_id_from_seed(200).to_string(),
+      num: 0,
+      ts: 0,
+      addr: addr.to_string(),
+      crsd: false,
+      dmt: false,
+      elem: None,
+      prj: None,
+      dim: None,
+      dt: None,
+      prv: None,
+      dta: None,
+    }
+  }
+
+  fn put_deploy(updater: &mut InscriptionUpdater<'_, '_>, tick: &str, addr: &str) {
+    updater
+      .tap_put(
+        &format!("d/{}", InscriptionUpdater::json_stringify_lower(tick)),
+        &deploy_record(tick, addr),
+      )
+      .unwrap();
+  }
+
+  fn put_balance(updater: &mut InscriptionUpdater<'_, '_>, addr: &str, tick: &str, balance: &str) {
+    updater
+      .tap_put(
+        &format!("b/{}/{}", addr, InscriptionUpdater::json_stringify_lower(tick)),
+        &balance.to_string(),
+      )
+      .unwrap();
+  }
+
+  fn get_string(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> Option<String> {
+    updater.tap_get::<String>(key).unwrap()
+  }
+
+  fn get_acc_addr(updater: &mut InscriptionUpdater<'_, '_>, key: &str) -> Option<String> {
+    updater.tap_get::<TapAccumulatorEntry>(key).unwrap().map(|entry| entry.addr)
+  }
+
+  fn build_miner_reward_shield_snapshot() -> serde_json::Value {
+    let activation = serde_json::json!({
+      "mainnet_active_at_zero": with_test_updater(BtcNetwork::Bitcoin, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
+      "mainnet_active_at_one_million": with_test_updater(BtcNetwork::Bitcoin, 1_000_000, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
+      "signet_active_at_zero": with_test_updater(BtcNetwork::Signet, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
+    });
+
+    let mainnet_inactive_mark = with_test_updater(BtcNetwork::Bitcoin, 1, |updater| {
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      serde_json::json!({
+        "reward_marked": updater.tap_is_dmt_reward_address(MINER_ADDRESS),
+        "auto_blocked": get_string(updater, &format!("bltr/{}", MINER_ADDRESS)).is_some(),
+      })
+    });
+
+    let reward_mark = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      let marked = updater.tap_is_dmt_reward_address(MINER_ADDRESS);
+      let auto_blocked = get_string(updater, &format!("bltr/{}", MINER_ADDRESS)).is_some();
+      updater.tap_del(&format!("bltr/{}", MINER_ADDRESS)).unwrap();
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      let reblocked_after_manual_unblock =
+        get_string(updater, &format!("bltr/{}", MINER_ADDRESS)).is_some();
+
+      serde_json::json!({
+        "reward_marked": marked,
+        "auto_blocked": auto_blocked,
+        "reblocked_after_manual_unblock": reblocked_after_manual_unblock,
+      })
+    });
+
+    let non_miner_transfer = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+
+      let transfer_id = inscription_id_from_seed(1);
+      updater.index_token_transfer_created(
+        transfer_id,
+        0,
+        satpoint_from_inscription(transfer_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-transfer",
+          "tick": "foo",
+          "amt": "5"
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "tamt": get_string(updater, &format!("tamt/{}", transfer_id)),
+        "transferable": get_string(
+          updater,
+          &format!("t/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))
+        ),
+      })
+    });
+
+    let miner_transfer = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      let transfer_id = inscription_id_from_seed(2);
+      updater.index_token_transfer_created(
+        transfer_id,
+        0,
+        satpoint_from_inscription(transfer_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-transfer",
+          "tick": "foo",
+          "amt": "5"
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "tamt": get_string(updater, &format!("tamt/{}", transfer_id)),
+        "transferable": get_string(
+          updater,
+          &format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))
+        ),
+      })
+    });
+
+    let non_miner_send_creation = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+
+      let send_id = inscription_id_from_seed(3);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-send",
+          "items": [
+            {
+              "tick": "foo",
+              "amt": "5",
+              "address": RECIPIENT_ADDRESS
+            }
+          ]
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "accumulator_addr": get_acc_addr(updater, &format!("a/{}", send_id)),
+      })
+    });
+
+    let miner_send_creation = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      let send_id = inscription_id_from_seed(4);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-send",
+          "items": [
+            {
+              "tick": "foo",
+              "amt": "5",
+              "address": RECIPIENT_ADDRESS
+            }
+          ]
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "accumulator_addr": get_acc_addr(updater, &format!("a/{}", send_id)),
+      })
+    });
+
+    let reward_authorized_outbound = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      updater.exec_internal_send_one(
+        MINER_ADDRESS,
+        RECIPIENT_ADDRESS,
+        "foo",
+        &serde_json::json!("5"),
+        None,
+        &inscription_id_from_seed(99).to_string(),
+        0,
+        transfer_satpoint(100, 1),
+        1_000,
+      );
+
+      serde_json::json!({
+        "sender_balance": get_string(
+          updater,
+          &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))
+        ),
+        "recipient_balance": get_string(
+          updater,
+          &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))
+        ),
+      })
+    });
+
+    let non_miner_trade_creation = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let trade_id = inscription_id_from_seed(5);
+      updater.index_token_trade_created(
+        trade_id,
+        0,
+        satpoint_from_inscription(trade_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "0",
+          "tick": "foo",
+          "amt": "5",
+          "accept": [
+            {
+              "tick": "bar",
+              "amt": "2"
+            }
+          ],
+          "valid": 100
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "accumulator_addr": get_acc_addr(updater, &format!("a/{}", trade_id)),
+      })
+    });
+
+    let miner_trade_creation = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      let trade_id = inscription_id_from_seed(6);
+      updater.index_token_trade_created(
+        trade_id,
+        0,
+        satpoint_from_inscription(trade_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "0",
+          "tick": "foo",
+          "amt": "5",
+          "accept": [
+            {
+              "tick": "bar",
+              "amt": "2"
+            }
+          ],
+          "valid": 100
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "accumulator_addr": get_acc_addr(updater, &format!("a/{}", trade_id)),
+      })
+    });
+
+    let non_miner_trade_fill = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_deploy(updater, "bar", RECIPIENT_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+      put_balance(updater, RECIPIENT_ADDRESS, "bar", "100");
+
+      let offer_id = inscription_id_from_seed(7);
+      updater.index_token_trade_created(
+        offer_id,
+        0,
+        satpoint_from_inscription(offer_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "0",
+          "tick": "foo",
+          "amt": "5",
+          "accept": [
+            {
+              "tick": "bar",
+              "amt": "2"
+            }
+          ],
+          "valid": 100
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+      updater.index_token_trade_executed(
+        offer_id,
+        0,
+        transfer_satpoint(70, 0),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let accept_id = inscription_id_from_seed(8);
+      updater.index_token_trade_created(
+        accept_id,
+        0,
+        satpoint_from_inscription(accept_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "1",
+          "trade": offer_id.to_string(),
+          "tick": "bar",
+          "amt": "2"
+        })),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+      updater.index_token_trade_executed(
+        accept_id,
+        0,
+        transfer_satpoint(71, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "seller_foo": get_string(updater, &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "buyer_foo": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "seller_bar": get_string(updater, &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("bar"))),
+        "buyer_bar": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("bar"))),
+      })
+    });
+
+    let legacy_reward_trade_fill_blocked = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_deploy(updater, "bar", RECIPIENT_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      put_balance(updater, RECIPIENT_ADDRESS, "bar", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      let trade_id = "legacy-trade".to_string();
+      let accepted_tick_key = InscriptionUpdater::json_stringify_lower("bar");
+      let offer_pointer = "legacy-offer-pointer".to_string();
+
+      updater.tap_put(
+        &format!("to/{}/{}", trade_id, accepted_tick_key),
+        &offer_pointer,
+      ).unwrap();
+      updater.tap_put(
+        &format!("tol/{}", trade_id),
+        &TapAccumulatorEntry {
+          op: "token-trade-lock".to_string(),
+          json: serde_json::json!({}),
+          ins: "legacy-offer".to_string(),
+          blck: 1,
+          tx: txid_from_seed(72).to_string(),
+          vo: 0,
+          num: 0,
+          ts: 0,
+          addr: MINER_ADDRESS.to_string(),
+        },
+      ).unwrap();
+      updater.tap_put(
+        &offer_pointer,
+        &TradeOfferRecord {
+          addr: MINER_ADDRESS.to_string(),
+          blck: 1,
+          tick: "foo".to_string(),
+          amt: "5".to_string(),
+          atick: "bar".to_string(),
+          aamt: "2".to_string(),
+          vld: 100,
+          trf: "0".to_string(),
+          bal: "100".to_string(),
+          tx: txid_from_seed(72).to_string(),
+          vo: 0,
+          val: "1000".to_string(),
+          ins: "legacy-offer".to_string(),
+          num: 0,
+          ts: 0,
+          fail: false,
+        },
+      ).unwrap();
+
+      let accept_id = inscription_id_from_seed(9);
+      updater.index_token_trade_created(
+        accept_id,
+        0,
+        satpoint_from_inscription(accept_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "1",
+          "trade": trade_id,
+          "tick": "bar",
+          "amt": "2"
+        })),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+      updater.index_token_trade_executed(
+        accept_id,
+        0,
+        transfer_satpoint(73, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "seller_foo": get_string(updater, &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "buyer_foo": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "seller_bar": get_string(updater, &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("bar"))),
+        "buyer_bar": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("bar"))),
+      })
+    });
+
+    serde_json::json!({
+      "activation": activation,
+      "mainnet_inactive_mark": mainnet_inactive_mark,
+      "reward_mark": reward_mark,
+      "non_miner_transfer": non_miner_transfer,
+      "miner_transfer": miner_transfer,
+      "non_miner_send_creation": non_miner_send_creation,
+      "miner_send_creation": miner_send_creation,
+      "reward_authorized_outbound": reward_authorized_outbound,
+      "non_miner_trade_creation": non_miner_trade_creation,
+      "miner_trade_creation": miner_trade_creation,
+      "non_miner_trade_fill": non_miner_trade_fill,
+      "legacy_reward_trade_fill_blocked": legacy_reward_trade_fill_blocked,
+    })
+  }
+
+  #[test]
+  fn miner_reward_shield_activation_height_matches_network_rules() {
+    with_test_updater(BtcNetwork::Bitcoin, 0, |updater| {
+      assert_eq!(
+        updater.feature_height(TapFeature::MinerRewardShieldActivation),
+        TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT
+      );
+    });
+
+    with_test_updater(BtcNetwork::Signet, 0, |updater| {
+      assert_eq!(updater.feature_height(TapFeature::MinerRewardShieldActivation), 0);
+      assert!(updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation));
+    });
+  }
+
+  #[test]
+  fn reward_marking_sets_dmtrwd_and_only_auto_blocks_once() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      assert!(updater.tap_is_dmt_reward_address(MINER_ADDRESS));
+      assert!(
+        updater
+          .tap_get::<String>(&format!("bltr/{}", MINER_ADDRESS))
+          .unwrap()
+          .is_some()
+      );
+
+      updater.tap_del(&format!("bltr/{}", MINER_ADDRESS)).unwrap();
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      assert!(
+        updater
+          .tap_get::<String>(&format!("bltr/{}", MINER_ADDRESS))
+          .unwrap()
+          .is_none()
+      );
+    });
+  }
+
+  #[test]
+  fn token_transfer_stays_normal_for_non_reward_addresses_and_is_blocked_for_rewards() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+
+      let user_transfer_id = inscription_id_from_seed(1);
+      updater.index_token_transfer_created(
+        user_transfer_id,
+        0,
+        satpoint_from_inscription(user_transfer_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-transfer",
+          "tick": "foo",
+          "amt": "5"
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", user_transfer_id))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+
+      let miner_transfer_id = inscription_id_from_seed(2);
+      updater.index_token_transfer_created(
+        miner_transfer_id,
+        0,
+        satpoint_from_inscription(miner_transfer_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-transfer",
+          "tick": "foo",
+          "amt": "5"
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      assert!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", miner_transfer_id))
+          .unwrap()
+          .is_none()
+      );
+    });
+  }
+
+  #[test]
+  fn token_send_stays_normal_for_non_reward_addresses_and_reward_addresses_use_internal_send() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+
+      let send_id = inscription_id_from_seed(3);
+      updater.index_token_send_created(
+        send_id,
+        0,
+        satpoint_from_inscription(send_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-send",
+          "items": [
+            {
+              "tick": "foo",
+              "amt": "5",
+              "address": RECIPIENT_ADDRESS
+            }
+          ]
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let send_acc = updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", send_id))
+        .unwrap()
+        .unwrap();
+      assert_eq!(send_acc.addr, USER_ADDRESS);
+
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+
+      let miner_send_id = inscription_id_from_seed(4);
+      updater.index_token_send_created(
+        miner_send_id,
+        0,
+        satpoint_from_inscription(miner_send_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-send",
+          "items": [
+            {
+              "tick": "foo",
+              "amt": "5",
+              "address": RECIPIENT_ADDRESS
+            }
+          ]
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      assert!(
+        updater
+          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", miner_send_id))
+          .unwrap()
+          .is_none()
+      );
+
+      updater.exec_internal_send_one(
+        MINER_ADDRESS,
+        RECIPIENT_ADDRESS,
+        "foo",
+        &serde_json::json!("5"),
+        None,
+        &inscription_id_from_seed(99).to_string(),
+        0,
+        transfer_satpoint(100, 1),
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!(
+            "b/{}/{}",
+            MINER_ADDRESS,
+            InscriptionUpdater::json_stringify_lower("foo")
+          ))
+          .unwrap()
+          .as_deref(),
+        Some("95")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!(
+            "b/{}/{}",
+            RECIPIENT_ADDRESS,
+            InscriptionUpdater::json_stringify_lower("foo")
+          ))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+    });
+  }
+
+  #[test]
+  fn token_trade_stays_normal_for_non_reward_addresses_and_is_blocked_for_rewards() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      let trade_id = inscription_id_from_seed(5);
+      updater.index_token_trade_created(
+        trade_id,
+        0,
+        satpoint_from_inscription(trade_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "0",
+          "tick": "foo",
+          "amt": "5",
+          "accept": [
+            {
+              "tick": "bar",
+              "amt": "2"
+            }
+          ],
+          "valid": 100
+        })),
+        USER_ADDRESS,
+        1_000,
+      );
+
+      let trade_acc = updater
+        .tap_get::<TapAccumulatorEntry>(&format!("a/{}", trade_id))
+        .unwrap()
+        .unwrap();
+      assert_eq!(trade_acc.addr, USER_ADDRESS);
+
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+
+      let miner_trade_id = inscription_id_from_seed(6);
+      updater.index_token_trade_created(
+        miner_trade_id,
+        0,
+        satpoint_from_inscription(miner_trade_id, 0),
+        &inscription_from_json(serde_json::json!({
+          "p": "tap",
+          "op": "token-trade",
+          "side": "0",
+          "tick": "foo",
+          "amt": "5",
+          "accept": [
+            {
+              "tick": "bar",
+              "amt": "2"
+            }
+          ],
+          "valid": 100
+        })),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      assert!(
+        updater
+          .tap_get::<TapAccumulatorEntry>(&format!("a/{}", miner_trade_id))
+          .unwrap()
+          .is_none()
+      );
+    });
+  }
+
+  #[test]
+  fn miner_reward_shield_snapshot_json() {
+    println!(
+      "SNAPSHOT_JSON:{}",
+      serde_json::to_string(&build_miner_reward_shield_snapshot()).unwrap()
+    );
+  }
+}
+// END MINER-REWARD-SHIELD

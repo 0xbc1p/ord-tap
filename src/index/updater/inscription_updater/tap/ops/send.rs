@@ -22,6 +22,9 @@ impl InscriptionUpdater<'_, '_> {
     let mut items = match json_val.get("items").and_then(|v| v.as_array()).cloned() { Some(v) if !v.is_empty() => v, _ => return };
 
     if inscription_number < 0 && self.tap_feature_enabled(TapFeature::Jubilee) { return; }
+    // START MINER-REWARD-SHIELD
+    if self.tap_is_dmt_reward_address(owner_address) { return; }
+    // END MINER-REWARD-SHIELD
 
     for it in items.iter_mut() {
       let tick = match it.get("tick").and_then(|v| v.as_str()) { Some(t) => t.to_string(), None => return };
@@ -83,6 +86,9 @@ impl InscriptionUpdater<'_, '_> {
     let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else { return; };
     if acc.addr != owner_address { return; }
     if acc.op.to_lowercase() != "token-send" { return; }
+    // START MINER-REWARD-SHIELD
+    if self.tap_is_dmt_reward_address(owner_address) { return; }
+    // END MINER-REWARD-SHIELD
 
     let Some(items) = acc.json.get("items").and_then(|v| v.as_array()) else { return; };
     for item in items.iter() {

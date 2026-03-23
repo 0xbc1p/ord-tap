@@ -21,6 +21,9 @@ impl InscriptionUpdater<'_, '_> {
     let side = json_val.get("side").and_then(|v| v.as_str().or(v.as_i64().map(|n| if n==0 {"0"} else {"1"}))).unwrap_or("").to_string();
     if p != "tap" || op != "token-trade" { return; }
     if side != "0" && side != "1" { return; }
+    // START MINER-REWARD-SHIELD
+    if self.tap_is_dmt_reward_address(owner_address) { return; }
+    // END MINER-REWARD-SHIELD
 
     // Writer parity: side==0 with a trade id present is admitted without
     // requiring tick/amt/accept/valid (used for cancel/unlock flows).
@@ -124,6 +127,9 @@ impl InscriptionUpdater<'_, '_> {
     let Some(acc) = self.tap_get::<TapAccumulatorEntry>(&key).ok().flatten() else { return; };
     if acc.addr != owner_address { return; }
     if acc.op.to_lowercase() != "token-trade" { return; }
+    // START MINER-REWARD-SHIELD
+    if self.tap_is_dmt_reward_address(owner_address) { return; }
+    // END MINER-REWARD-SHIELD
 
     let side = acc.json.get("side").and_then(|v| v.as_str().or(v.as_i64().map(|n| if n==0 {"0"} else {"1"}))).unwrap_or("");
     if side == "0" {
@@ -217,6 +223,9 @@ impl InscriptionUpdater<'_, '_> {
       let Some(ptr) = self.tap_get::<String>(&format!("to/{}/{}", trade_id.trim(), accepted_tick_key)).ok().flatten() else { return; };
       if self.tap_get::<TapAccumulatorEntry>(&format!("tol/{}", trade_id.trim())).ok().flatten().is_none() { return; }
       let Some(offer) = self.tap_get::<TradeOfferRecord>(&ptr).ok().flatten() else { return; };
+      // START MINER-REWARD-SHIELD
+      if self.tap_is_dmt_reward_address(&offer.addr) { return; }
+      // END MINER-REWARD-SHIELD
       if offer.addr == acc.addr { return; }
       // Ensure accepted tick matches offer
       if offer.atick.to_lowercase() != accepted_tick.to_lowercase() { return; }

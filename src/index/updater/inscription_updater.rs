@@ -323,6 +323,9 @@ impl InscriptionUpdater<'_, '_> {
           let _ = self.tap_set_list_record(&format!("atl/{}", address), &format!("atli/{}", address), &tick_lower_for_list);
           let _ = self.tap_put(&format!("ato/{}/{}", address, tick_key), &"".to_string());
         }
+        // START MINER-REWARD-SHIELD
+        self.tap_mark_dmt_reward_address(&address);
+        // END MINER-REWARD-SHIELD
         // mark block as minted to prevent duplicates
         let _ = self.tap_put(&format!("dmt-blk/{}/{}", tick_lower, self.height), &"".to_string());
       }
