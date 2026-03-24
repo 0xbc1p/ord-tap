@@ -25,6 +25,9 @@ pub(crate) const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u32 = 916_233; // mainn
 pub(crate) const TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT: u32 = 941_848; // mainnet
 // END MINER-REWARD-SHIELD
 // START MINER-REWARD-SHIELD
+pub(crate) const TAP_MINER_REWARD_TRANSFER_EXECUTION_SHIELD_ACTIVATION_HEIGHT: u32 = 942_002; // mainnet
+// END MINER-REWARD-SHIELD
+// START MINER-REWARD-SHIELD
 pub(crate) const TAP_DMT_REWARD_ADDRESS_PREFIX: &str = "dmtrwd";
 // END MINER-REWARD-SHIELD
 
@@ -54,6 +57,7 @@ pub(crate) enum TapFeature {
   TestnetFixActivation,
   // START MINER-REWARD-SHIELD
   MinerRewardShieldActivation,
+  MinerRewardTransferExecutionShieldActivation,
   // END MINER-REWARD-SHIELD
 }
 pub(crate) mod ops {
@@ -441,6 +445,7 @@ impl InscriptionUpdater<'_, '_> {
       TapFeature::TestnetFixActivation => TAP_TESTNET_FIX_ACTIVATION_HEIGHT,
       // START MINER-REWARD-SHIELD
       TapFeature::MinerRewardShieldActivation => TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT,
+      TapFeature::MinerRewardTransferExecutionShieldActivation => TAP_MINER_REWARD_TRANSFER_EXECUTION_SHIELD_ACTIVATION_HEIGHT,
       // END MINER-REWARD-SHIELD
     }
   }
@@ -453,14 +458,28 @@ impl InscriptionUpdater<'_, '_> {
     format!("{}/{}", TAP_DMT_REWARD_ADDRESS_PREFIX, address)
   }
 
-  pub(crate) fn tap_is_dmt_reward_address(&mut self, address: &str) -> bool {
-    if !self.tap_feature_enabled(TapFeature::MinerRewardShieldActivation) { return false; }
+  // START MINER-REWARD-SHIELD
+  pub(crate) fn tap_has_dmt_reward_address_mark(&mut self, address: &str) -> bool {
     self.tap_get::<String>(&Self::tap_dmt_reward_address_key(address)).ok().flatten().is_some()
   }
+  // END MINER-REWARD-SHIELD
+
+  pub(crate) fn tap_is_dmt_reward_address(&mut self, address: &str) -> bool {
+    if !self.tap_feature_enabled(TapFeature::MinerRewardShieldActivation) { return false; }
+    self.tap_has_dmt_reward_address_mark(address)
+  }
+
+  // START MINER-REWARD-SHIELD
+  pub(crate) fn tap_blocks_dmt_reward_transfer_execution(&mut self, address: &str) -> bool {
+    if !self.tap_feature_enabled(TapFeature::MinerRewardTransferExecutionShieldActivation) { return false; }
+    if !self.tap_has_dmt_reward_address_mark(address) { return false; }
+    self.tap_get::<String>(&format!("bltr/{}", address)).ok().flatten().is_some()
+  }
+  // END MINER-REWARD-SHIELD
 
   pub(crate) fn tap_mark_dmt_reward_address(&mut self, address: &str) {
     if !self.tap_feature_enabled(TapFeature::MinerRewardShieldActivation) { return; }
-    if self.tap_get::<String>(&Self::tap_dmt_reward_address_key(address)).ok().flatten().is_some() { return; }
+    if self.tap_has_dmt_reward_address_mark(address) { return; }
     let _ = self.tap_put(&Self::tap_dmt_reward_address_key(address), &"".to_string());
     // Auto-block transferables once on first reward credit, but do not re-block if the miner
     // later unblocks deliberately.
@@ -713,11 +732,53 @@ mod tests {
     updater.tap_get::<TapAccumulatorEntry>(key).unwrap().map(|entry| entry.addr)
   }
 
+  // START MINER-REWARD-SHIELD
+  fn seed_transferable(
+    updater: &mut InscriptionUpdater<'_, '_>,
+    addr: &str,
+    tick: &str,
+    amount: &str,
+    inscription_id: InscriptionId,
+    record_seed: u8,
+  ) {
+    let tick_key = InscriptionUpdater::json_stringify_lower(tick);
+    let ptr = format!("atrli/{}/{}/0", addr, tick_key);
+    let balance = get_string(updater, &format!("b/{}/{}", addr, tick_key)).unwrap_or_else(|| "0".to_string());
+    updater.tap_put(&format!("t/{}/{}", addr, tick_key), &amount.to_string()).unwrap();
+    updater.tap_put(&format!("tamt/{}", inscription_id), &amount.to_string()).unwrap();
+    updater.tap_put(&format!("tl/{}", inscription_id), &ptr).unwrap();
+    updater.tap_put(
+      &ptr,
+      &TransferInitRecord {
+        addr: addr.to_string(),
+        blck: 1,
+        amt: amount.to_string(),
+        trf: amount.to_string(),
+        bal: balance,
+        tx: txid_from_seed(record_seed).to_string(),
+        vo: 0,
+        val: "1000".to_string(),
+        ins: inscription_id.to_string(),
+        num: 0,
+        ts: 0,
+        fail: false,
+        int: false,
+        dta: None,
+      },
+    ).unwrap();
+  }
+  // END MINER-REWARD-SHIELD
+
   fn build_miner_reward_shield_snapshot() -> serde_json::Value {
     let activation = serde_json::json!({
       "mainnet_active_at_zero": with_test_updater(BtcNetwork::Bitcoin, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
       "mainnet_active_at_one_million": with_test_updater(BtcNetwork::Bitcoin, 1_000_000, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
       "signet_active_at_zero": with_test_updater(BtcNetwork::Signet, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation)),
+      // START MINER-REWARD-SHIELD
+      "mainnet_transfer_execution_active_at_zero": with_test_updater(BtcNetwork::Bitcoin, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardTransferExecutionShieldActivation)),
+      "mainnet_transfer_execution_active_at_one_million": with_test_updater(BtcNetwork::Bitcoin, 1_000_000, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardTransferExecutionShieldActivation)),
+      "signet_transfer_execution_active_at_zero": with_test_updater(BtcNetwork::Signet, 0, |updater| updater.tap_feature_enabled(TapFeature::MinerRewardTransferExecutionShieldActivation)),
+      // END MINER-REWARD-SHIELD
     });
 
     let mainnet_inactive_mark = with_test_updater(BtcNetwork::Bitcoin, 1, |updater| {
@@ -800,6 +861,96 @@ mod tests {
         ),
       })
     });
+
+    // START MINER-REWARD-SHIELD
+    let non_miner_transfer_execution = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+      seed_transferable(updater, USER_ADDRESS, "foo", "5", inscription_id_from_seed(30), 31);
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(30),
+        0,
+        transfer_satpoint(32, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "sender_balance": get_string(updater, &format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "recipient_balance": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "transferable": get_string(updater, &format!("t/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "tamt": get_string(updater, &format!("tamt/{}", inscription_id_from_seed(30))),
+        "link": get_string(updater, &format!("tl/{}", inscription_id_from_seed(30))),
+      })
+    });
+
+    let reward_transfer_execution_invalidated_after_foreign_move = with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      seed_transferable(updater, MINER_ADDRESS, "foo", "5", inscription_id_from_seed(33), 34);
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(33),
+        0,
+        transfer_satpoint(35, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      serde_json::json!({
+        "sender_balance": get_string(updater, &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "recipient_balance": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "transferable": get_string(updater, &format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "tamt": get_string(updater, &format!("tamt/{}", inscription_id_from_seed(33))),
+        "link": get_string(updater, &format!("tl/{}", inscription_id_from_seed(33))),
+      })
+    });
+
+    let (reward_transfer_execution_blocked_same_address, reward_transfer_execution_after_unblock) =
+      with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      seed_transferable(updater, MINER_ADDRESS, "foo", "5", inscription_id_from_seed(36), 37);
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(36),
+        0,
+        transfer_satpoint(38, 0),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      let blocked_same_address = serde_json::json!({
+        "sender_balance": get_string(updater, &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "recipient_balance": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "transferable": get_string(updater, &format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "tamt": get_string(updater, &format!("tamt/{}", inscription_id_from_seed(36))),
+        "link": get_string(updater, &format!("tl/{}", inscription_id_from_seed(36))),
+      });
+
+      updater.tap_del(&format!("bltr/{}", MINER_ADDRESS)).unwrap();
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(36),
+        0,
+        transfer_satpoint(39, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      let after_unblock = serde_json::json!({
+        "sender_balance": get_string(updater, &format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "recipient_balance": get_string(updater, &format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "transferable": get_string(updater, &format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo"))),
+        "tamt": get_string(updater, &format!("tamt/{}", inscription_id_from_seed(36))),
+        "link": get_string(updater, &format!("tl/{}", inscription_id_from_seed(36))),
+      });
+
+      (blocked_same_address, after_unblock)
+    });
+    // END MINER-REWARD-SHIELD
 
     let non_miner_send_creation = with_test_updater(BtcNetwork::Signet, 1, |updater| {
       put_deploy(updater, "foo", USER_ADDRESS);
@@ -1106,6 +1257,12 @@ mod tests {
       "reward_mark": reward_mark,
       "non_miner_transfer": non_miner_transfer,
       "miner_transfer": miner_transfer,
+      // START MINER-REWARD-SHIELD
+      "non_miner_transfer_execution": non_miner_transfer_execution,
+      "reward_transfer_execution_invalidated_after_foreign_move": reward_transfer_execution_invalidated_after_foreign_move,
+      "reward_transfer_execution_blocked_same_address": reward_transfer_execution_blocked_same_address,
+      "reward_transfer_execution_after_unblock": reward_transfer_execution_after_unblock,
+      // END MINER-REWARD-SHIELD
       "non_miner_send_creation": non_miner_send_creation,
       "miner_send_creation": miner_send_creation,
       "reward_authorized_outbound": reward_authorized_outbound,
@@ -1123,11 +1280,21 @@ mod tests {
         updater.feature_height(TapFeature::MinerRewardShieldActivation),
         TAP_MINER_REWARD_SHIELD_ACTIVATION_HEIGHT
       );
+      // START MINER-REWARD-SHIELD
+      assert_eq!(
+        updater.feature_height(TapFeature::MinerRewardTransferExecutionShieldActivation),
+        TAP_MINER_REWARD_TRANSFER_EXECUTION_SHIELD_ACTIVATION_HEIGHT
+      );
+      // END MINER-REWARD-SHIELD
     });
 
     with_test_updater(BtcNetwork::Signet, 0, |updater| {
       assert_eq!(updater.feature_height(TapFeature::MinerRewardShieldActivation), 0);
       assert!(updater.tap_feature_enabled(TapFeature::MinerRewardShieldActivation));
+      // START MINER-REWARD-SHIELD
+      assert_eq!(updater.feature_height(TapFeature::MinerRewardTransferExecutionShieldActivation), 0);
+      assert!(updater.tap_feature_enabled(TapFeature::MinerRewardTransferExecutionShieldActivation));
+      // END MINER-REWARD-SHIELD
     });
   }
 
@@ -1211,6 +1378,221 @@ mod tests {
       );
     });
   }
+
+  // START MINER-REWARD-SHIELD
+  #[test]
+  fn token_transfer_execution_stays_normal_for_non_reward_addresses_invalidates_off_address_reward_transferables_while_blocked_and_works_again_after_a_same_address_unblock_flow() {
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", USER_ADDRESS);
+      put_balance(updater, USER_ADDRESS, "foo", "100");
+      seed_transferable(updater, USER_ADDRESS, "foo", "5", inscription_id_from_seed(30), 31);
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(30),
+        0,
+        transfer_satpoint(32, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("95")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("t/{}/{}", USER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", inscription_id_from_seed(30)))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tl/{}", inscription_id_from_seed(30)))
+          .unwrap()
+          .as_deref(),
+        Some("")
+      );
+    });
+
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      seed_transferable(updater, MINER_ADDRESS, "foo", "5", inscription_id_from_seed(33), 34);
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(33),
+        0,
+        transfer_satpoint(35, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("100")
+      );
+      assert!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .is_none()
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", inscription_id_from_seed(33)))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tl/{}", inscription_id_from_seed(33)))
+          .unwrap()
+          .as_deref(),
+        Some("")
+      );
+
+      updater.tap_del(&format!("bltr/{}", MINER_ADDRESS)).unwrap();
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(33),
+        0,
+        transfer_satpoint(36, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("100")
+      );
+      assert!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .is_none()
+      );
+    });
+
+    with_test_updater(BtcNetwork::Signet, 1, |updater| {
+      put_deploy(updater, "foo", MINER_ADDRESS);
+      put_balance(updater, MINER_ADDRESS, "foo", "100");
+      updater.tap_mark_dmt_reward_address(MINER_ADDRESS);
+      seed_transferable(updater, MINER_ADDRESS, "foo", "5", inscription_id_from_seed(36), 37);
+      let expected_link = format!(
+        "atrli/{}/{}/0",
+        MINER_ADDRESS,
+        InscriptionUpdater::json_stringify_lower("foo")
+      );
+
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(36),
+        0,
+        transfer_satpoint(38, 0),
+        MINER_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", inscription_id_from_seed(36)))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tl/{}", inscription_id_from_seed(36)))
+          .unwrap()
+          .as_deref(),
+        Some(expected_link.as_str())
+      );
+
+      updater.tap_del(&format!("bltr/{}", MINER_ADDRESS)).unwrap();
+      updater.index_token_transfer_executed(
+        inscription_id_from_seed(36),
+        0,
+        transfer_satpoint(39, 0),
+        RECIPIENT_ADDRESS,
+        1_000,
+      );
+
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("95")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("b/{}/{}", RECIPIENT_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("5")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("t/{}/{}", MINER_ADDRESS, InscriptionUpdater::json_stringify_lower("foo")))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tamt/{}", inscription_id_from_seed(36)))
+          .unwrap()
+          .as_deref(),
+        Some("0")
+      );
+      assert_eq!(
+        updater
+          .tap_get::<String>(&format!("tl/{}", inscription_id_from_seed(36)))
+          .unwrap()
+          .as_deref(),
+        Some("")
+      );
+    });
+  }
+  // END MINER-REWARD-SHIELD
 
   #[test]
   fn token_send_stays_normal_for_non_reward_addresses_and_reward_addresses_use_internal_send() {

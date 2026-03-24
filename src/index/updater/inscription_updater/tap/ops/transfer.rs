@@ -167,6 +167,26 @@ impl InscriptionUpdater<'_, '_> {
     if self.tap_get::<DeployRecord>(&format!("d/{}", tick_key)).ok().flatten().is_none() { return; }
 
     let sender = atr.addr.clone();
+    let receiver = owner_address.to_string();
+    // START MINER-REWARD-SHIELD
+    if self.tap_blocks_dmt_reward_transfer_execution(&sender) {
+      if receiver != sender {
+        let transfer_key = format!("t/{}/{}", sender, tick_key);
+        if let Some(transferable_s) = self.tap_get::<String>(&transfer_key).ok().flatten() {
+          let transferable = transferable_s.parse::<i128>().unwrap_or(0);
+          let amount = atr.amt.parse::<i128>().unwrap_or(0);
+          let new_transferable = (transferable - amount).max(0);
+          let _ = self.tap_put(&transfer_key, &new_transferable.to_string());
+        } else {
+          let _ = self.tap_del(&transfer_key);
+        }
+        let _ = self.tap_put(&format!("tamt/{}", inscription_id), &"0".to_string());
+        let _ = self.tap_put(&format!("tl/{}", inscription_id), &"".to_string());
+        let _ = self.tap_del(&format!("kind/{}", inscription_id));
+      }
+      return;
+    }
+    // END MINER-REWARD-SHIELD
     let bal_key = format!("b/{}/{}", sender, tick_key);
     if let Some(balance_s) = self.tap_get::<String>(&bal_key).ok().flatten() {
       let mut balance = balance_s.parse::<i128>().unwrap_or(0);
@@ -187,7 +207,6 @@ impl InscriptionUpdater<'_, '_> {
         balance = new_balance;
         transferable = new_transferable;
 
-        let receiver = owner_address.to_string();
         let burn_addr = "1BitcoinEaterAddressDontSendf59kuE".to_string();
         let recv_display = if receiver.trim() == "-" { &burn_addr } else { &receiver };
 
