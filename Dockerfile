@@ -32,8 +32,7 @@ WORKDIR /var/lib/ord-tap
 ENV RUST_BACKTRACE=1 \
     RUST_LOG=info \
     ORD_TAP_INDEX=/var/lib/ord-tap/index.redb \
-    ORD_TAP_HTTP_PORT=3333 \
-    ORD_TAP_HTTP_HOST=0.0.0.0
+    ORD_TAP_HTTP_PORT=3333
 
 EXPOSE 3333
 VOLUME ["/var/lib/ord-tap"]

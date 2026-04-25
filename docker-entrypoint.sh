@@ -23,7 +23,9 @@ GLOBAL=""
 if [ "$#" -eq 0 ] || [ "$1" = "server" ]; then
   [ "$#" -gt 0 ] && shift
   SERVER_ARGS="--http --http-port ${ORD_TAP_HTTP_PORT:-3333}"
-  [ -n "$ORD_TAP_HTTP_HOST" ] && SERVER_ARGS="$SERVER_ARGS --http-host $ORD_TAP_HTTP_HOST"
+  # NOTE: this fork's `server` subcommand does not accept --http-host;
+  # ord binds to 0.0.0.0 by default. Honor ORD_TAP_HTTP_HOST only if a
+  # future release adds it.
   # shellcheck disable=SC2086
   exec /usr/local/bin/ord $GLOBAL server $SERVER_ARGS "$@"
 fi
